@@ -23,27 +23,18 @@
 
 package net.socialgamer.cah.util;
 
-import java.util.Collections;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.TreeMap;
-import java.util.WeakHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
-
-import org.apache.log4j.Logger;
-
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import com.google.inject.Singleton;
-
 import net.socialgamer.cah.Constants;
 import net.socialgamer.cah.data.User;
+import org.apache.log4j.Logger;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 
 /**
@@ -76,17 +67,8 @@ public class ChatFilter {
     CAPSLOCK, DROP_MESSAGE, NO_MESSAGE, NOT_ENOUGH_SPACES, OK, REPEAT, REPEAT_WORDS, TOO_FAST, TOO_LONG, TOO_MANY_SPECIALS
   }
 
-  private enum Scope {
-    global, game
-  }
-
-  @Inject
-  public ChatFilter(final Provider<Properties> propsProvider) {
-    this.propsProvider = propsProvider;
-  }
-
   public Result filterGlobal(final User user, final String message) {
-    final Result result = filterCommon(Scope.global, user, message);
+    final Result result = filterCommon(Scope.GLOBAL, user, message);
     if (Result.OK != result) {
       return result;
     }
@@ -94,51 +76,73 @@ public class ChatFilter {
     final long total = message.codePoints().count();
 
     if (!SIMPLE_MESSAGE_PATTERN.matcher(message).matches()
-        && total >= getIntParameter(Scope.global, "basic_min_len", DEFAULT_BASIC_MIN_MSG_LENGTH)) {
+            && total >= getIntParameter(Scope.GLOBAL, "basic_min_len", DEFAULT_BASIC_MIN_MSG_LENGTH)) {
       // do some more in-depth analysis. we don't want too many emoji or non-latin characters
       final long basic = message.codePoints()
-          .filter(c -> Character.isJavaIdentifierPart(c) || Character.isSpaceChar(c))
-          .count();
-      if (((double) basic) / total < getDoubleParameter(Scope.global, "basic_ratio",
-          DEFAULT_BASIC_CHARACTER_RATIO)) {
+              .filter(c -> Character.isJavaIdentifierPart(c) || Character.isSpaceChar(c))
+              .count();
+      if (((double) basic) / total < getDoubleParameter(Scope.GLOBAL, "basic_ratio",
+              DEFAULT_BASIC_CHARACTER_RATIO)) {
         return Result.TOO_MANY_SPECIALS;
       }
     }
 
     final String[] words = message.toLowerCase(Locale.ENGLISH).split("\\s+");
     final int spaces = words.length + 1;
-    if (total >= getIntParameter(Scope.global, "spaces_min_len", DEFAULT_SPACES_MIN_MSG_LENGTH)
-        && spaces < getIntParameter(Scope.global, "spaces_min_count", DEFAULT_SPACES_REQUIRED)) {
+    if (total >= getIntParameter(Scope.GLOBAL, "spaces_min_len", DEFAULT_SPACES_MIN_MSG_LENGTH)
+            && spaces < getIntParameter(Scope.GLOBAL, "spaces_min_count", DEFAULT_SPACES_REQUIRED)) {
       return Result.NOT_ENOUGH_SPACES;
     }
 
     final Set<String> uniqueWords = ImmutableSet.copyOf(words);
-    if (words.length >= getIntParameter(Scope.global, "repeated_words_min_count",
-        DEFAULT_REPEATED_WORDS_MIN_COUNT)
-        && ((double) uniqueWords.size()) / words.length < getDoubleParameter(Scope.global,
+    if (words.length >= getIntParameter(Scope.GLOBAL, "repeated_words_min_count",
+            DEFAULT_REPEATED_WORDS_MIN_COUNT)
+            && ((double) uniqueWords.size()) / words.length < getDoubleParameter(Scope.GLOBAL,
             "repeated_words_unique_ratio", DEFAULT_REPEATED_WORDS_UNIQUE_RATIO)) {
       return Result.REPEAT_WORDS;
     }
 
-    final long caps = message.codePoints().filter(c -> Character.isUpperCase(c)).count();
-    if (total >= getIntParameter(Scope.global, "capslock_min_len", DEFAULT_CAPSLOCK_MIN_MSG_LENGTH)
-        && ((double) caps) / total > getDoubleParameter(Scope.global, "capslock_ratio",
+    final long caps = message.codePoints().filter(Character::isUpperCase).count();
+    if (total >= getIntParameter(Scope.GLOBAL, "capslock_min_len", DEFAULT_CAPSLOCK_MIN_MSG_LENGTH)
+            && ((double) caps) / total > getDoubleParameter(Scope.GLOBAL, "capslock_ratio",
             DEFAULT_CAPSLOCK_RATIO)) {
       return Result.CAPSLOCK;
     }
 
-    getMessageTimes(user, Scope.global).add(System.currentTimeMillis());
+    getMessageTimes(user, Scope.GLOBAL).add(System.currentTimeMillis());
     return Result.OK;
   }
 
+  @Inject
+  public ChatFilter(final Provider<Properties> propsProvider) {
+    this.propsProvider = propsProvider;
+  }
+
   public Result filterGame(final User user, final String message) {
-    final Result result = filterCommon(Scope.game, user, message);
+    final Result result = filterCommon(Scope.GAME, user, message);
     if (Result.OK != result) {
       return result;
     }
 
-    getMessageTimes(user, Scope.game).add(System.currentTimeMillis());
+    getMessageTimes(user, Scope.GAME).add(System.currentTimeMillis());
     return Result.OK;
+  }
+
+  private Set<String> getShadowbanCharacters() {
+    try {
+      return ((ShadowBannedStringProvider) Class
+              .forName(getPropValue("pyx.chat.shadowban_strings_provider",
+                      DEFAULT_SHADOWBAN_PROVIDER)).getDeclaredConstructor().newInstance()).getShadowBannedStrings();
+    } catch (final InstantiationException | IllegalAccessException | ClassNotFoundException
+            | ClassCastException e) {
+      LOG.error(String.format("Unable to load shadowban string provider %s, using empty set.",
+              getPropValue("pyx.chat.shadowban_strings_provider", DEFAULT_SHADOWBAN_PROVIDER)),
+              e);
+      return Collections.emptySet();
+    } catch (NoSuchMethodException | InvocationTargetException e) {
+      LOG.error(String.format("Error: %s", e.getLocalizedMessage()));
+      return Collections.emptySet();
+    }
   }
 
   private Result filterCommon(final Scope scope, final User user, final String message) {
@@ -197,26 +201,20 @@ public class ChatFilter {
       final double defaultValue) {
     try {
       return Double.parseDouble(
-          getPropValue(String.format("pyx.chat.%s.%s", scope, name), String.valueOf(defaultValue)));
+              getPropValue(String.format("pyx.chat.%s.%s", scope, name), String.valueOf(defaultValue)));
     } catch (final NumberFormatException e) {
       LOG.warn(String.format("Unable to parse pyx.chat.%s.%s as a number,"
-          + " using default of %d", scope, name, defaultValue), e);
+              + " using default of %d", scope, name, defaultValue), e);
       return defaultValue;
     }
   }
 
-  private Set<String> getShadowbanCharacters() {
-    try {
-      return ((ShadowBannedStringProvider) Class
-          .forName(getPropValue("pyx.chat.shadowban_strings_provider",
-          DEFAULT_SHADOWBAN_PROVIDER)).newInstance()).getShadowBannedStrings();
-    } catch (final InstantiationException | IllegalAccessException | ClassNotFoundException
-        | ClassCastException e) {
-      LOG.error(String.format("Unable to load shadowban string provider %s, using empty set.",
-          getPropValue("pyx.chat.shadowban_strings_provider", DEFAULT_SHADOWBAN_PROVIDER)),
-          e);
-      return Collections.emptySet();
+  private FilterData getFilterData(final User user) {
+    FilterData data;
+    synchronized (filterData) {
+      data = filterData.computeIfAbsent(user, user1 -> new FilterData());
     }
+    return data;
   }
 
   private String getPropValue(final String name, final String defaultValue) {
@@ -229,21 +227,11 @@ public class ChatFilter {
 
   private long getFloodTimeMillis(final Scope scope) {
     return TimeUnit.SECONDS
-        .toMillis(getIntParameter(scope, "flood_time", DEFAULT_CHAT_FLOOD_TIME_SECONDS));
+            .toMillis(getIntParameter(scope, "flood_time", DEFAULT_CHAT_FLOOD_TIME_SECONDS));
   }
 
-  private FilterData getFilterData(final User user) {
-    FilterData data;
-    synchronized (filterData) {
-      data = filterData.get(user);
-      // we should only have to do this once per user...
-      if (null == data) {
-        LOG.trace(String.format("Created new FilterData for user %s", user.getNickname()));
-        data = new FilterData();
-        filterData.put(user, data);
-      }
-    }
-    return data;
+  private enum Scope {
+    GLOBAL, GAME
   }
 
   private List<Long> getMessageTimes(final User user, final Scope scope) {
@@ -256,8 +244,8 @@ public class ChatFilter {
 
     private FilterData() {
       final Map<Scope, List<Long>> map = new TreeMap<>();
-      map.put(Scope.global, Collections.synchronizedList(new LinkedList<>()));
-      map.put(Scope.game, Collections.synchronizedList(new LinkedList<>()));
+      map.put(Scope.GLOBAL, Collections.synchronizedList(new LinkedList<>()));
+      map.put(Scope.GAME, Collections.synchronizedList(new LinkedList<>()));
       lastMessageTimes = Collections.unmodifiableMap(map);
     }
   }
